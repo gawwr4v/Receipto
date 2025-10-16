@@ -45,6 +45,11 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import androidx.compose.material.icons.filled.*
+import com.example.receipto.model.ParseResult
+import com.example.receipto.model.ReceiptData
+import com.example.receipto.model.ReceiptItem
+import com.example.receipto.parser.ReceiptParser
 
 @Composable
 fun CameraScreen() {
@@ -290,6 +295,455 @@ fun CameraViewScreen(
 }
 
 @Composable
+fun ParsedReceiptView(parseResult: ParseResult?, isProcessing: Boolean) {
+    Column(
+        modifier = Modifier.fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        if (isProcessing) {
+            Box(
+                modifier = Modifier.fillMaxWidth().padding(32.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
+            }
+        } else {
+            when (parseResult) {
+                is ParseResult.Success -> ReceiptDataCard(parseResult.data)
+                is ParseResult.PartialSuccess -> {
+                    ReceiptDataCard(parseResult.data)
+                    WarningsCard(parseResult.warnings)
+                }
+                is ParseResult.Failure -> ErrorCard(parseResult.error)
+                null -> Text("No parsing results yet")
+            }
+        }
+    }
+}
+
+@Composable
+fun ReceiptDataCard(receipt: ReceiptData) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            // Header with confidence score
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Receipt Details",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Surface(
+                    color = when {
+                        receipt.getConfidenceScore() > 0.8f -> MaterialTheme.colorScheme.primary
+                        receipt.getConfidenceScore() > 0.5f -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.error
+                    },
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        "${(receipt.getConfidenceScore() * 100).toInt()}% confidence",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Store info
+            receipt.storeName?.let {
+                DataRow(icon = Icons.Default.Store, label = "Store", value = it)
+            }
+
+            receipt.storeAddress?.let {
+                DataRow(icon = Icons.Default.LocationOn, label = "Address", value = it)
+            }
+
+            receipt.storePhone?.let {
+                DataRow(icon = Icons.Default.Phone, label = "Phone", value = it)
+            }
+
+            // Date & Time
+            Row(modifier = Modifier.fillMaxWidth()) {
+                receipt.date?.let {
+                    Column(modifier = Modifier.weight(1f)) {
+                        DataRow(
+                            icon = Icons.Default.CalendarToday,
+                            label = "Date",
+                            value = it.toString()
+                        )
+                    }
+                }
+                receipt.time?.let {
+                    Column(modifier = Modifier.weight(1f)) {
+                        DataRow(
+                            icon = Icons.Default.AccessTime,
+                            label = "Time",
+                            value = it.toString()
+                        )
+                    }
+                }
+            }
+
+            // Items section
+            if (receipt.items.isNotEmpty()) {
+                Divider(modifier = Modifier.padding(vertical = 16.dp))
+
+                Text(
+                    "Items (${receipt.items.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                receipt.items.forEach { item ->
+                    ItemRow(item)
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+            }
+
+            // Totals section
+            Divider(modifier = Modifier.padding(vertical = 16.dp))
+
+            receipt.subtotal?.let {
+                TotalRow("Subtotal", it, false)
+            }
+
+            receipt.tax?.let {
+                TotalRow("Tax", it, false)
+            }
+
+            receipt.total?.let {
+                TotalRow("Total", it, true)
+            }
+
+            // Payment & Transaction info
+            if (receipt.paymentMethod != null || receipt.transactionId != null || receipt.cashier != null) {
+                Divider(modifier = Modifier.padding(vertical = 16.dp))
+
+                receipt.paymentMethod?.let {
+                    DataRow(icon = Icons.Default.Payment, label = "Payment", value = it)
+                }
+
+                receipt.transactionId?.let {
+                    DataRow(icon = Icons.Default.Tag, label = "Transaction", value = it)
+                }
+
+                receipt.cashier?.let {
+                    DataRow(icon = Icons.Default.Person, label = "Cashier", value = it)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DataRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            modifier = Modifier.size(20.dp),
+            tint = MaterialTheme.colorScheme.primary
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                value,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+fun ItemRow(item: ReceiptItem) {
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                item.name,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium
+            )
+            if (item.quantity != null) {
+                Text(
+                    "Qty: ${item.quantity}${item.unit ?: ""}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Text(
+            "$${String.format("%.2f", item.price)}",
+            style = MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary
+        )
+    }
+}
+
+@Composable
+fun TotalRow(label: String, amount: Double, isGrandTotal: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            style = if (isGrandTotal) MaterialTheme.typography.titleMedium
+            else MaterialTheme.typography.bodyMedium,
+            fontWeight = if (isGrandTotal) FontWeight.Bold else FontWeight.Normal
+        )
+        Text(
+            "$${String.format("%.2f", amount)}",
+            style = if (isGrandTotal) MaterialTheme.typography.titleLarge
+            else MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.Bold,
+            color = if (isGrandTotal) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+@Composable
+fun WarningsCard(warnings: List<String>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    "Parsing Warnings",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            warnings.forEach { warning ->
+                Text(
+                    "• $warning",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ErrorCard(error: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(
+                Icons.Default.Error,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(48.dp)
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                "Parsing Failed",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                error,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+fun RawOcrView(ocrResult: OcrResult?, isProcessing: Boolean) {
+    Column(
+        modifier = Modifier.fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        if (isProcessing) {
+            CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+        } else {
+            when (ocrResult) {
+                is OcrResult.Success -> {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text(
+                                "Raw OCR Text",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceEvenly
+                            ) {
+                                StatItem("Lines", ocrResult.lineCount.toString())
+                                StatItem("Words", ocrResult.wordCount.toString())
+                                StatItem("Confidence", "${(ocrResult.avgConfidence * 100).toInt()}%")
+                            }
+                            Divider(modifier = Modifier.padding(vertical = 16.dp))
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = MaterialTheme.colorScheme.surface,
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = ocrResult.fullText,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                is OcrResult.Error -> ErrorCard(ocrResult.message)
+                null -> Text("No OCR results")
+            }
+        }
+    }
+}
+
+@Composable
+fun BarcodesView(barcodeResult: BarcodeScanResult?, isProcessing: Boolean) {
+    Column(
+        modifier = Modifier.fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        if (isProcessing) {
+            CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+        } else {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                ),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.QrCode2,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            "Barcodes",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight =
+
+                                FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+                    when (barcodeResult) {
+                        is BarcodeScanResult.Success -> {
+                            barcodeResult.barcodes.forEachIndexed { index, barcode ->
+                                if (index > 0) Spacer(modifier = Modifier.height(12.dp))
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = MaterialTheme.colorScheme.surface,
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text(
+                                            barcode.format,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            barcode.displayValue,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        is BarcodeScanResult.NoBarcodes -> {
+                            Text(
+                                "No barcodes detected",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        is BarcodeScanResult.Error -> ErrorCard(barcodeResult.message)
+                        null -> Text("No barcode results")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun ImagePreviewScreen(
     imageUri: Uri,
     onRetake: () -> Unit,
@@ -297,25 +751,40 @@ fun ImagePreviewScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
     var isProcessing by remember { mutableStateOf(false) }
     var ocrResult by remember { mutableStateOf<OcrResult?>(null) }
     var barcodeResult by remember { mutableStateOf<BarcodeScanResult?>(null) }
+    var parsedReceipt by remember { mutableStateOf<ParseResult?>(null) }
     var showResults by remember { mutableStateOf(false) }
+    var currentTab by remember { mutableStateOf(0) } // 0=Parsed, 1=Raw OCR, 2=Barcodes
 
     LaunchedEffect(imageUri) {
         isProcessing = true
         scope.launch {
+            // Run OCR
             val ocrProcessor = OcrProcessor(context)
-            ocrResult = ocrProcessor.processImage(imageUri)
+            val ocr = ocrProcessor.processImage(imageUri)
+            ocrResult = ocr
             ocrProcessor.close()
+
+            // Parse receipt if OCR succeeded
+            if (ocr is OcrResult.Success) {
+                val parser = ReceiptParser()
+                parsedReceipt = parser.parse(ocr.fullText)
+            }
+
+            // Scan barcodes
             val barcodeScanner = BarcodeScanner(context)
             barcodeResult = barcodeScanner.scanImage(imageUri)
             barcodeScanner.close()
+
             isProcessing = false
         }
     }
 
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        // Header
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = MaterialTheme.colorScheme.primaryContainer,
@@ -327,7 +796,7 @@ fun ImagePreviewScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (showResults) "Processing Results" else "Preview",
+                    text = if (showResults) "Receipt Details" else "Preview",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
@@ -354,8 +823,35 @@ fun ImagePreviewScreen(
         }
 
         if (showResults) {
-            ResultsView(ocrResult, barcodeResult, isProcessing) { showResults = false }
+            // Tabs for different views
+            TabRow(
+                selectedTabIndex = currentTab,
+                containerColor = MaterialTheme.colorScheme.surface
+            ) {
+                Tab(
+                    selected = currentTab == 0,
+                    onClick = { currentTab = 0 },
+                    text = { Text("Parsed Data") }
+                )
+                Tab(
+                    selected = currentTab == 1,
+                    onClick = { currentTab = 1 },
+                    text = { Text("Raw OCR") }
+                )
+                Tab(
+                    selected = currentTab == 2,
+                    onClick = { currentTab = 2 },
+                    text = { Text("Barcodes") }
+                )
+            }
+
+            when (currentTab) {
+                0 -> ParsedReceiptView(parsedReceipt, isProcessing)
+                1 -> RawOcrView(ocrResult, isProcessing)
+                2 -> BarcodesView(barcodeResult, isProcessing)
+            }
         } else {
+            // Image preview
             Box(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(16.dp),
                 contentAlignment = Alignment.Center
@@ -372,6 +868,7 @@ fun ImagePreviewScreen(
                         contentScale = ContentScale.Fit
                     )
                 }
+
                 if (isProcessing) {
                     Surface(
                         modifier = Modifier.fillMaxSize(),
@@ -400,6 +897,7 @@ fun ImagePreviewScreen(
             }
         }
 
+        // Action buttons
         Row(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -428,7 +926,6 @@ fun ImagePreviewScreen(
             }
         }
     }
-
 }
 
 @Composable
