@@ -16,31 +16,35 @@ object TextCleaner {
             .trim()
     }
 
-    /**
-     * Fix common OCR character recognition errors
-     */
     private fun String.fixCommonOcrErrors(): String {
         return this
             // Number/Letter confusion
-            .replace(Regex("""\bO(?=\d)"""), "0")  // O → 0 before digits
-            .replace(Regex("""(?<=\d)O\b"""), "0") // O → 0 after digits
-            .replace(Regex("""\bl(?=\d)"""), "1")  // l → 1 before digits
-            .replace(Regex("""(?<=\d)l\b"""), "1") // l → 1 after digits
-            .replace(Regex("""\bS(?=\d)"""), "5")  // S → 5 before digits
+            .replace(Regex("""\bO(?=\d)"""), "0")
+            .replace(Regex("""(?<=\d)O\b"""), "0")
+            .replace(Regex("""\bl(?=\d)"""), "1")
+            .replace(Regex("""(?<=\d)l\b"""), "1")
+            .replace(Regex("""\bS(?=\d)"""), "5")
+            .replace(Regex("""\bB(?=\d)"""), "8")
 
             // Common word errors
             .replace("Sa les", "Sales", ignoreCase = true)
             .replace("T0TAL", "TOTAL", ignoreCase = true)
             .replace("T0tal", "Total", ignoreCase = true)
-            .replace("TAX:", "TAX:", ignoreCase = true)
+            .replace("TOTA L", "TOTAL", ignoreCase = true)
             .replace("CA5H", "CASH", ignoreCase = true)
             .replace("CRED1T", "CREDIT", ignoreCase = true)
 
+            // Currency symbol confusion
+            .replace(" S ", " $ ", ignoreCase = false)  // S misread as $
+            .replace("$$ ", "$ ")  // Double $
+
             // Price formatting
-            .replace("LI-", "1.")  // Common OCR error for 1.
+            .replace("LI-", "1.")
             .replace("l-", "1.")
-            .replace(",00", ".00")  // European decimal to US
-            .replace(Regex("""(\d),(\d{2})\b"""), "$1.$2") // 12,99 → 12.99
+            .replace("I-", "1.")
+            .replace(" - ", ".")  // Sometimes - is misread period
+
+        // Decimal/comma normalization happens later in pipeline
     }
 
     /**
@@ -130,5 +134,64 @@ object TextCleaner {
         }
 
         return costs[s2.length]
+    }
+
+    /**
+     * Normalize currency symbols and formats
+     */
+    fun normalizeCurrency(text: String): String {
+        return text
+            // Standardize currency symbols to $
+            .replace("€", "$")
+            .replace("£", "$")
+            .replace("¥", "$")
+            .replace("₹", "$")
+
+            // Fix spacing around currency
+            .replace(Regex("""\$\s*(\d)"""), "$$1")  // Remove space after $
+            .replace(Regex("""(\d)\s*\$"""), "$1$")  // Remove space before $
+
+            // Handle negative amounts
+            .replace("($", "-$")
+            .replace(")$", "")
+    }
+
+
+
+    /**
+     * Clean price string to standardized format
+     */
+    fun cleanPriceString(priceStr: String): String {
+        return priceStr
+            .replace("$", "")
+            .replace("€", "")
+            .replace("£", "")
+            .replace("¥", "")
+            .replace("₹", "")
+            .replace(" ", "")
+            .trim()
+    }
+
+
+    /**
+     * Enhanced number extraction with currency awareness
+     */
+
+    fun extractPrices(text: String): List<Double> {
+        val prices = mutableListOf<Double>()
+        val pricePattern = Regex("""$?\s*(\d{1,}[.,]\d{2})\b""")
+
+        pricePattern.findAll(text).forEach { match ->
+            val priceStr = match.groupValues[1].replace(",", ".")
+
+            priceStr.toDoubleOrNull()?.let {
+                if (it > 0.0 && it < 1_000_000.0) {
+                    prices.add(it)
+                }
+            }
+        }
+
+        return prices
+
     }
 }
