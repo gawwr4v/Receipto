@@ -37,29 +37,35 @@ data class ReceiptData(
      */
     fun getConfidenceScore(): Float {
         var score = 0f
-        var maxScore = 0f
 
-        // Store name (20%)
-        maxScore += 0.2f
-        if (storeName != null) score += 0.2f
+        // Store name (15%)
+        if (storeName != null && storeName.length >= 3) score += 0.15f
 
-        // Date (15%)
-        maxScore += 0.15f
-        if (date != null) score += 0.15f
+        // Date (10%)
+        if (date != null) score += 0.10f
 
-        // Total (30%)
-        maxScore += 0.3f
-        if (total != null) score += 0.3f
+        // Total (35% - most important!)
+        if (total != null && total > 0) score += 0.35f
 
         // Items (25%)
-        maxScore += 0.25f
-        if (items.isNotEmpty()) score += 0.25f
+        when {
+            items.size >= 3 -> score += 0.25f
+            items.size >= 1 -> score += 0.15f
+        }
 
         // Tax (10%)
-        maxScore += 0.1f
-        if (tax != null) score += 0.1f
+        if (tax != null && tax > 0) score += 0.10f
 
-        return if (maxScore > 0) score / maxScore else 0f
+        // Subtotal validation (5% bonus if subtotal + tax ≈ total)
+        if (subtotal != null && tax != null && total != null) {
+            val calculatedTotal = subtotal + tax
+            val diff = kotlin.math.abs(calculatedTotal - total)
+            if (diff < 0.50) {  // Within 50 cents
+                score += 0.05f
+            }
+        }
+
+        return score.coerceIn(0f, 1f)
     }
 
 }

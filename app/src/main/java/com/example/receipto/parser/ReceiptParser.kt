@@ -3,22 +3,20 @@ package com.example.receipto.parser
 import com.example.receipto.model.ParseResult
 import com.example.receipto.model.ReceiptData
 import com.example.receipto.model.ReceiptItem
+import com.example.receipto.ocr.ClassifiedRegion
+import com.example.receipto.ocr.RegionType
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
-/**
- * Main receipt parsing engine
- * Takes messy OCR text and extracts structured data
- */
 class ReceiptParser {
 
     private val rules = ParsingRules
 
     /**
-     * Parse raw OCR text into structured receipt data
+     * Enhanced parsing with region information from OpenCV
      */
-    fun parse(rawText: String): ParseResult {
+    fun parseWithRegions(rawText: String, regions: List<ClassifiedRegion>): ParseResult {
         if (rawText.isBlank()) {
             return ParseResult.Failure("Empty text provided")
         }
@@ -32,21 +30,31 @@ class ReceiptParser {
 
         val warnings = mutableListOf<String>()
 
-        // Extract all components
-        val storeName = extractStoreName(lines)
-        val storeAddress = extractAddress(lines)
+        // Use regions for better parsing
+        val headerLines = getLinesInRegion(lines, regions, RegionType.HEADER)
+        val itemLines = getLinesInRegion(lines, regions, RegionType.ITEMS)
+        val totalsLines = getLinesInRegion(lines, regions, RegionType.TOTALS)
+
+        val storeName = extractStoreName(headerLines.ifEmpty { lines.take(5) })
+        val storeAddress = extractAddress(headerLines.ifEmpty { lines.take(10) })
         val storePhone = extractPhone(cleanText)
         val date = extractDate(cleanText)
         val time = extractTime(cleanText)
-        val items = extractItems(lines)
-        val total = extractTotal(lines, cleanText)
-        val subtotal = extractSubtotal(lines, cleanText)
-        val tax = extractTax(lines, cleanText)
+
+        // Enhanced item extraction using ITEMS region
+        val items = extractItems(itemLines.ifEmpty { lines })
+
+        val total = extractTotal(totalsLines.ifEmpty { lines }, cleanText)
+        val subtotal = extractSubtotal(totalsLines.ifEmpty { lines }, cleanText)
+
+        // NEW: Extract multiple tax types
+        val taxes = extractAllTaxes(totalsLines.ifEmpty { lines }, cleanText)
+        val totalTax = taxes.values.sum()
+
         val paymentMethod = extractPaymentMethod(cleanText)
         val transactionId = extractTransactionId(cleanText)
         val cashier = extractCashier(cleanText)
 
-        // Build receipt data
         val receiptData = ReceiptData(
             storeName = storeName,
             storeAddress = storeAddress,
@@ -55,21 +63,20 @@ class ReceiptParser {
             time = time,
             items = items,
             subtotal = subtotal,
-            tax = tax,
-            total = total
-
-            ,
+            tax = totalTax,
+            total = total,
             paymentMethod = paymentMethod,
             transactionId = transactionId,
             cashier = cashier,
             rawText = rawText
         )
 
-        // Generate warnings
         if (storeName == null) warnings.add("Could not detect store name")
+        if (storeAddress == null) warnings.add("Could not detect store address")
         if (date == null) warnings.add("Could not parse date")
         if (total == null) warnings.add("Could not find total amount")
         if (items.isEmpty()) warnings.add("No items detected")
+        if (taxes.isEmpty()) warnings.add("No tax information found")
 
         return when {
             !receiptData.isValid() -> ParseResult.Failure("Insufficient data extracted")
@@ -78,20 +85,49 @@ class ReceiptParser {
         }
     }
 
+    // Fallback for backward compatibility
+    fun parse(rawText: String): ParseResult {
+        return parseWithRegions(rawText, emptyList())
+    }
+
     /**
-     * Extract store name (usually first few lines)
+     * Get lines that belong to a specific region type
      */
+    private fun getLinesInRegion(
+        lines: List<String>,
+        regions: List<ClassifiedRegion>,
+        regionType: RegionType
+    ): List<String> {
+        if (regions.isEmpty()) return emptyList()
+
+        val targetRegions = regions.filter { it.type == regionType }
+        if (targetRegions.isEmpty()) return emptyList()
+
+
+
+// For simplicity, returning all lines (region bounding boxes would need more complex matching)
+// will enhance this later to match lines to bounding boxes
+        return when (regionType) {
+            RegionType.HEADER -> lines.take((lines.size * 0.2).toInt().coerceAtLeast(3))
+            RegionType.ITEMS -> {
+                val start = (lines.size * 0.2).toInt()
+                val end = (lines.size * 0.7).toInt()
+                lines.subList(start.coerceIn(0, lines.size), end.coerceIn(0, lines.size))
+            }
+            RegionType.TOTALS -> lines.takeLast((lines.size * 0.3).toInt().coerceAtLeast(5))
+            RegionType.FOOTER -> lines.takeLast((lines.size * 0.15).toInt().coerceAtLeast(2))
+            RegionType.UNKNOWN -> emptyList()
+        }
+    }
+
     private fun extractStoreName(lines: List<String>): String? {
-        // Look in first 5 lines
         val candidates = lines.take(5)
 
         for (line in candidates) {
-            // Skip lines that look like addresses or common header text
             if (rules.addressIndicators.any { line.contains(it, ignoreCase = true) }) continue
             if (rules.excludeFromStoreName.any { line.contains(it, ignoreCase = true) }) continue
             if (line.length < 3 || line.length > 50) continue
 
-            // Good candidate: mostly letters, not too many numbers
             val letterRatio = line.count { it.isLetter() }.toFloat() / line.length
             if (letterRatio > 0.5) {
                 return line.trim()
@@ -102,37 +138,38 @@ class ReceiptParser {
     }
 
     /**
-     * Extract address
+     * ENHANCED: Better address detection
      */
     private fun extractAddress(lines: List<String>): String? {
-        val addressLines = lines.filter { line ->
-            rules.addressIndicators.any { line.contains(it, ignoreCase = true) } ||
-                    line.matches(Regex(""".*\d+.*""")) // Contains numbers (street numbers)
-        }.take(2)
+        val addressLines = mutableListOf<String>()
+
+        for (line in lines) {
+            val isAddressLine = rules.addressIndicators.any {
+                line.contains(it, ignoreCase = true)
+            } || line.matches(Regex(""".*\d+.*[A-Za-z].*""")) // Has numbers and letters
+
+            if (isAddressLine && line.length > 5) {
+                addressLines.add(line.trim())
+                if (addressLines.size >= 2) break
+            }
+        }
 
         return if (addressLines.isNotEmpty()) {
             addressLines.joinToString(", ")
         } else null
     }
 
-    /**
-     * Extract phone number
-     */
     private fun extractPhone(text: String): String? {
         return rules.phonePatterns.firstNotNullOfOrNull { pattern ->
             pattern.find(text)?.value
         }
     }
 
-    /**
-     * Extract date
-     */
     private fun extractDate(text: String): LocalDate? {
         for (pattern in rules.datePatterns) {
             val match = pattern.find(text) ?: continue
 
             return try {
-                // Try different date formats
                 val dateStr = match.value
                 parseDateString(dateStr)
             } catch (e: Exception) {
@@ -162,9 +199,6 @@ class ReceiptParser {
         return null
     }
 
-    /**
-     * Extract time
-     */
     private fun extractTime(text: String): LocalTime? {
         val timePattern = rules.timePatterns.first()
         val match = timePattern.find(text) ?: return null
@@ -178,7 +212,7 @@ class ReceiptParser {
     }
 
     /**
-     * Extract items from receipt
+     * ENHANCED: Better item extraction
      */
     private fun extractItems(lines: List<String>): List<ReceiptItem> {
         val items = mutableListOf<ReceiptItem>()
@@ -186,12 +220,28 @@ class ReceiptParser {
         for (line in lines) {
             if (!rules.isLikelyItemLine(line)) continue
 
-            val price = rules.extractPriceFromLine(line) ?: continue
+            val prices = rules.extractAllPricesFromLine(line)
+            if (prices.isEmpty()) continue
+
+            // Skip if line contains total/tax keywords
+            if (rules.totalKeywords.any { line.contains(it, ignoreCase = true) }) continue
+            if (rules.taxKeywords.any { line.contains(it, ignoreCase = true) }) continue
+            if (rules.subtotalKeywords.any { line.contains(it, ignoreCase = true) }) continue
+
+            val price = prices.last()
             val name = rules.extractItemName(line) ?: continue
+
+            if (name.length < 2) continue
+
+            // Extract quantity
+            val quantityPattern = Regex("""(\d+\.?\d*)\s*(?:x|X|@|lb|kg|oz|ea)""", RegexOption.IGNORE_CASE)
+            val quantityMatch = quantityPattern.find(name)
+            val quantity = quantityMatch?.groupValues?.get(1)?.toDoubleOrNull()
 
             items.add(
                 ReceiptItem(
-                    name = name,
+                    name = name.trim(),
+                    quantity = quantity,
                     price = price
                 )
             )
@@ -200,84 +250,80 @@ class ReceiptParser {
         return items
     }
 
-    /**
-     * Extract total amount
-     */
     private fun extractTotal(lines: List<String>, fullText: String): Double? {
-        // Look for lines with "total" keyword
         val totalLines = lines.filter { line ->
             rules.totalKeywords.any { keyword ->
                 line.contains(keyword, ignoreCase = true)
             }
         }
 
-        // Extract highest price from total lines
-        return totalLines.mapNotNull { line ->
-            rules.extractPriceFromLine(line)
-        }.maxOrNull() ?: findLargestPrice(fullText)
+        val totalPrices = totalLines.flatMap { line ->
+            rules.extractAllPricesFromLine(line)
+        }
+
+        val maxFromTotalLines = totalPrices.maxOrNull()
+        val fallbackMax = TextCleaner.extractPrices(fullText).maxOrNull()
+
+        return maxFromTotalLines ?: fallbackMax
     }
 
-    /**
-     * Extract subtotal
-     */
-    private
-
-    fun extractSubtotal(lines: List<String>, fullText: String): Double? {
+    private fun extractSubtotal(lines: List<String>, fullText: String): Double? {
         val subtotalLines = lines.filter { line ->
             rules.subtotalKeywords.any { keyword ->
                 line.contains(keyword, ignoreCase = true)
             }
         }
 
-        return subtotalLines.firstNotNullOfOrNull { line ->
-            rules.extractPriceFromLine(line)
-        }
+        return subtotalLines.flatMap { line ->
+            rules.extractAllPricesFromLine(line)
+        }.maxOrNull()
     }
 
     /**
-     * Extract tax amount
+     * NEW: Extract multiple tax types (Sales Tax, State Tax, Local Tax, etc.)
      */
-    private fun extractTax(lines: List<String>, fullText: String): Double? {
+    private fun extractAllTaxes(lines: List<String>, fullText: String): Map<String, Double> {
+        val taxes = mutableMapOf<String, Double>()
+
         val taxLines = lines.filter { line ->
             rules.taxKeywords.any { keyword ->
                 line.contains(keyword, ignoreCase = true)
             }
         }
 
-        return taxLines.firstNotNullOfOrNull { line ->
-            rules.extractPriceFromLine(line)
+        for (line in taxLines) {
+            val prices = rules.extractAllPricesFromLine(line)
+            if (prices.isEmpty()) continue
+
+            // Determine tax type
+            val taxType = when {
+                line.contains("sales", ignoreCase = true) -> "Sales Tax"
+                line.contains("state", ignoreCase = true) -> "State Tax"
+                line.contains("local", ignoreCase = true) -> "Local Tax"
+                line.contains("gst", ignoreCase = true) -> "GST"
+                line.contains("vat", ignoreCase = true) -> "VAT"
+                line.contains("hst", ignoreCase = true) -> "HST"
+                else -> "Tax"
+            }
+
+            taxes[taxType] = prices.first()
         }
+
+        return taxes
     }
 
-    /**
-     * Find largest price in text (fallback for total)
-     */
-    private fun findLargestPrice(text: String): Double? {
-        return TextCleaner.extractNumbers(text).maxOrNull()
-    }
-
-    /**
-     * Extract payment method
-     */
     private fun extractPaymentMethod(text: String): String? {
         return rules.paymentKeywords.firstOrNull { keyword ->
             text.contains(keyword, ignoreCase = true)
         }?.replaceFirstChar { it.uppercase() }
     }
 
-    /**
-     * Extract transaction ID
-     */
     private fun extractTransactionId(text: String): String? {
         return rules.transactionIdPatterns.firstNotNullOfOrNull { pattern ->
-
             pattern.find(text)?.groupValues?.get(1)
         }
     }
 
-    /**
-     * Extract cashier name
-     */
     private fun extractCashier(text: String): String? {
         return rules.cashierPatterns.firstNotNullOfOrNull { pattern ->
             pattern.find(text)?.groupValues?.get(1)?.trim()
