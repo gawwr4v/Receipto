@@ -56,6 +56,14 @@ android {
     }
 }
 
+configurations.all {
+    resolutionStrategy {
+        force ("org.tensorflow:tensorflow-lite:2.16.1")
+        force ("org.tensorflow:tensorflow-lite-api:2.16.1")
+        force ("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1")
+    }
+}
+
 dependencies{
 // Core Android
     implementation("androidx.core:core-ktx:1.12.0")
@@ -93,19 +101,18 @@ dependencies{
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-// ML Kit Text Recognition - OCR (Offline)
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+// ML Kit Text Recognition - EXCLUDE bundled TFLite
+    implementation("com.google.mlkit:text-recognition:16.0.1") {
+        exclude(group = "org.tensorflow", module = "tensorflow-lite")
+    }
 
-// ML Kit Barcode Scanning (Offline)
-    implementation("com.google.mlkit:barcode-scanning:17.2.0")
+// ML Kit Barcode Scanning - EXCLUDE bundled TFLite
+    implementation("com.google.mlkit:barcode-scanning:17.2.0") {
+        exclude(group = "org.tensorflow", module = "tensorflow-lite")
+    }
 
-
-    // OpenCV as module
-    //implementation(project(":opencv"))
-    implementation(project(":sdk"))  //https://proandroiddev.com/android-studio-step-by-step-guide-to-download-and-install-opencv-for-android-9ddcb78a8bc3
-                                    // ^ helped a lot
-
-
+// OpenCV as module
+    implementation(project(":sdk"))
 
 // Coil for image loading
     implementation("io.coil-kt:coil-compose:2.5.0")
@@ -118,6 +125,13 @@ dependencies{
 
 // Play Services Tasks for Kotlin Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
+
+// TensorFlow Lite - explicit versions (MUST come after ML Kit)
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1")
+
+// JSON
+    implementation("com.google.code.gson:gson:2.10.1")
 
 // Testing
     testImplementation("junit:junit:4.13.2")
