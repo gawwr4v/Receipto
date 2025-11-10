@@ -68,10 +68,8 @@ object ParsingRules {
     fun isLikelyItemLine(line: String): Boolean {
         val cleanLine = line.trim()
 
-
-        if (cleanLine.length < 3
-
-        ) return false
+        // More lenient minimum length
+        if (cleanLine.length < 2) return false
 
         val hasText = cleanLine.any { it.isLetter() }
         val endsWithNumber = pricePatterns.any { it.find(cleanLine) != null }
@@ -80,9 +78,12 @@ object ParsingRules {
             cleanLine.contains(it, ignoreCase = true)
         } || taxKeywords.any {
             cleanLine.contains(it, ignoreCase = true)
+        } || subtotalKeywords.any {
+            cleanLine.contains(it, ignoreCase = true)
         }
 
-        return hasText && endsWithNumber && !hasExcludedKeyword
+        // More lenient: just needs text OR price (not necessarily both)
+        return (hasText || endsWithNumber) && !hasExcludedKeyword
     }
 
     fun extractAllPricesFromLine(line: String): List<Double> {

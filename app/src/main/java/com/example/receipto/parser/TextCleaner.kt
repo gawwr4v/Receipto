@@ -1,5 +1,8 @@
 package com.example.receipto.parser
 
+import android.util.Log
+import com.example.receipto.model.ReceiptItem
+
 /**
  * Clean and normalize OCR text for better parsing
  */
@@ -35,18 +38,23 @@ object TextCleaner {
             .replace("CRED1T", "CREDIT", ignoreCase = true)
 
             // Currency symbol confusion
-            .replace(" S ", " $ ", ignoreCase = false)  // S misread as $
-            .replace("$$ ", "$ ")  // Double $
+            .replace(" S ", " $ ", ignoreCase = false)
+            .replace("$$ ", "$ ")
 
-            // Price formatting
+            // Price formatting fixes
+            // "9. 75" / "9 ,75" -> "9.75"
+            .replace(Regex("""(\d)\s*[.,]\s*(\d{2})"""), "$1.$2")
+            // Remove trailing single-letter codes: "122.34 A" -> "122.34"
+            .replace(Regex("""([0-9]+[.][0-9]{2})\s+[A-Z]\b"""), "$1")
+            // Remove trailing asterisks: "9.75*" -> "9.75"
+            .replace(Regex("""([0-9]+[.][0-9]{2})\*+\b"""), "$1")
+
+            // Hyphen/dot confusion
             .replace("LI-", "1.")
             .replace("l-", "1.")
             .replace("I-", "1.")
-            .replace(" - ", ".")  // Sometimes - is misread period
-
-        // Decimal/comma normalization happens later in pipeline
+            .replace(" - ", ".")
     }
-
     /**
      * Normalize whitespace
      */
