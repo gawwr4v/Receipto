@@ -1,0 +1,10 @@
+{
+  "max_tokens": 512,
+  "max_chars": 24,
+  "char_emb_dim": 48,
+  "bbox_dense_dim": 8,
+  "region_emb_dim": 8,
+  "lstm_hidden": 128,
+  "pad_id": 0,
+  "unk_id": 1
+}

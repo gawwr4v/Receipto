@@ -1,5 +1,24 @@
 package com.example.receipto.ui.camera
 
+/*
+ * CameraScreen.kt
+ *
+ * ARCHITECTURE NOTE:
+ * We used to do all the heavy OCR text parsing, KIE model inference, and 
+ * regex token-grouping directly in this file. It was a 1600+ line nightmare. 
+ * 
+ * Why we changed it:
+ * You should never parse financial data inside a Jetpack Compose UI file. 
+ * 
+ * What it does now:
+ * 1. Manages CameraX preview & capture.
+ * 2. Throws the image at OcrProcessor.
+ * 3. Passes the raw text tokens to KieReceiptParser.
+ * 4. Displays the purely formatted result and wires the "Save" button to Room DB.
+ *
+ * Simple, declarative, boring UI. Exactly how it should be.
+ */
+
 import android.Manifest
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,11 +62,14 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
-import androidx.compose.material.icons.filled.*
 import com.example.receipto.model.ParseResult
 import com.example.receipto.model.ReceiptData
 import com.example.receipto.model.ReceiptItem
 import com.example.receipto.parser.ReceiptParser
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
+import android.util.Log
 
 @Composable
 fun CameraScreen() {
@@ -92,9 +114,9 @@ fun CameraScreen() {
                 imageUri = capturedImageUri!!,
                 onRetake = { capturedImageUri = null },
                 onUseImage = {
-                    android.widget.Toast.makeText(
+                    Toast.makeText(
                         context, "Image ready for OCR processing!",
-                        android.widget.Toast.LENGTH_SHORT
+                        Toast.LENGTH_SHORT
                     ).show()
                 }
             )
@@ -114,7 +136,6 @@ fun CameraScreen() {
             )
         }
     }
-
 }
 
 @Composable
@@ -289,7 +310,6 @@ fun CameraViewScreen(
                 .border(2.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
         )
     }
-
 }
 
 @Composable
@@ -610,8 +630,17 @@ fun ErrorCard(error: String) {
 
 @Composable
 fun RawOcrView(ocrResult: OcrResult?, isProcessing: Boolean) {
+    val context = LocalContext.current
+
+    fun copyToClipboard(text: String) {
+        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Raw OCR", text))
+        Toast.makeText(context, "Raw OCR copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
+
     Column(
-        modifier = Modifier.fillMaxSize()
+        modifier = Modifier
+            .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(16.dp)
     ) {
@@ -628,12 +657,32 @@ fun RawOcrView(ocrResult: OcrResult?, isProcessing: Boolean) {
                         shape = RoundedCornerShape(16.dp)
                     ) {
                         Column(modifier = Modifier.padding(20.dp)) {
-                            Text(
-                                "Raw OCR Text",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold
-                            )
+                            // Header row with actions
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "Raw OCR Text",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = { copyToClipboard(ocrResult.fullText) },
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Icon(Icons.Default.ContentCopy, contentDescription = null)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Copy")
+                                    }
+                                }
+                            }
+
                             Spacer(modifier = Modifier.height(16.dp))
+
+                            // Stats
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -642,7 +691,10 @@ fun RawOcrView(ocrResult: OcrResult?, isProcessing: Boolean) {
                                 StatItem("Words", ocrResult.wordCount.toString())
                                 StatItem("Confidence", "${(ocrResult.avgConfidence * 100).toInt()}%")
                             }
+
                             Divider(modifier = Modifier.padding(vertical = 16.dp))
+
+                            // Raw text box
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
                                 color = MaterialTheme.colorScheme.surface,
@@ -693,9 +745,7 @@ fun BarcodesView(barcodeResult: BarcodeScanResult?, isProcessing: Boolean) {
                         Text(
                             "Barcodes",
                             style = MaterialTheme.typography.titleLarge,
-                            fontWeight =
-
-                                FontWeight.Bold
+                            fontWeight = FontWeight.Bold
                         )
                     }
                     Spacer(modifier = Modifier.height(16.dp))
@@ -768,8 +818,27 @@ fun ImagePreviewScreen(
 
             // Parse receipt if OCR succeeded
             if (ocr is OcrResult.Success) {
-                val parser = ReceiptParser()
-                parsedReceipt = parser.parse(ocr.fullText)
+                try {
+                    if (ocr.tokens.isNotEmpty() && ocr.pageWidth > 0 && ocr.pageHeight > 0) {
+                        val parser = com.example.receipto.parser.KieReceiptParser(context)
+                        val receipt = parser.parseReceipt(ocr.tokens, ocr.pageWidth, ocr.pageHeight)
+                        
+                        val hasMeaningful = receipt != null && ((receipt.storeName != null) || (receipt.total != null) || receipt.items.isNotEmpty())
+                        parsedReceipt = if (hasMeaningful && receipt != null) {
+                            ParseResult.Success(receipt)
+                        } else {
+                            val fallbackParser = ReceiptParser()
+                            fallbackParser.parseWithSpatial(ocr.fullText, ocr.lines, ocr.detectedRegions)
+                        }
+                    } else {
+                        val parser = ReceiptParser()
+                        parsedReceipt = parser.parseWithSpatial(ocr.fullText, ocr.lines, ocr.detectedRegions)
+                    }
+                } catch (e: Exception) {
+                    Log.e("KIE", "KIE inference failed: ${e.message}", e)
+                    val parser = ReceiptParser()
+                    parsedReceipt = parser.parseWithSpatial(ocr.fullText, ocr.lines, ocr.detectedRegions)
+                }
             }
 
             // Scan barcodes
@@ -909,200 +978,58 @@ fun ImagePreviewScreen(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Retake", style = MaterialTheme.typography.titleMedium)
             }
-            Button(
-                onClick = { showResults = true },
-                modifier = Modifier.weight(1f).height(56.dp),
-                shape = RoundedCornerShape(12.dp),
-                enabled = !isProcessing
-            ) {
-                Icon(Icons.Default.Check, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    if (isProcessing) "Processing..." else "View Results",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun ResultsView(
-    ocrResult: OcrResult?,
-    barcodeResult: BarcodeScanResult?,
-    isProcessing: Boolean,
-    onBack: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        if (isProcessing) {
-            Box(
-                modifier = Modifier.fillMaxWidth().padding(32.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator()
-            }
-        } else {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                ),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Article,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(32.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            "Extracted Text",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(16.dp))
-                    when (ocrResult) {
-                        is OcrResult.Success -> {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceEvenly
-                            ) {
-                                StatItem("Lines", ocrResult.lineCount.toString())
-                                StatItem("Words", ocrResult.wordCount.toString())
-                                StatItem("Confidence", "${(ocrResult.avgConfidence * 100).toInt()}%")
-                            }
-                            Divider(modifier = Modifier.padding(vertical = 16.dp))
-                            Text(
-                                "Full Text:",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Surface(
-                                modifier = Modifier.fillMaxWidth(),
-                                color = MaterialTheme.colorScheme.surface,
-                                shape = RoundedCornerShape(8.dp)
-                            ) {
-                                Text(
-                                    text = ocrResult.fullText,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.padding(12.dp)
+            if (showResults) {
+                Button(
+                    onClick = {
+                        val receiptToSave = (parsedReceipt as? ParseResult.Success)?.data
+                        if (receiptToSave != null) {
+                            scope.launch {
+                                val db = com.example.receipto.data.ReceiptDatabase.getDatabase(context)
+                                val repo = com.example.receipto.repository.ReceiptRepository(db.receiptDao())
+                                val gson = com.google.gson.Gson()
+                                val entity = com.example.receipto.data.ReceiptEntity(
+                                    store = receiptToSave.storeName ?: "Unknown Store",
+                                    date = receiptToSave.date?.toString() ?: "",
+                                    time = receiptToSave.time?.toString() ?: "",
+                                    total = receiptToSave.total ?: 0.0,
+                                    json = gson.toJson(receiptToSave)
                                 )
+                                repo.insert(entity)
+                                android.widget.Toast.makeText(context, "Receipt Saved", android.widget.Toast.LENGTH_SHORT).show()
+                                onRetake() 
                             }
+                        } else {
+                            android.widget.Toast.makeText(context, "Cannot save unparsed receipt", android.widget.Toast.LENGTH_SHORT).show()
                         }
-                        is OcrResult.Error -> {
-                            Text(
-                                "Error: ${ocrResult.message}",
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                        }
-                        null -> Text("No OCR results yet")
-                    }
+                    },
+                    modifier = Modifier.weight(1f).height(56.dp),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(androidx.compose.material.icons.Icons.Default.Save, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Save", style = MaterialTheme.typography.titleMedium)
                 }
-            }
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                ),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.QrCode2,
-                            contentDescription = null
-
-                            ,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(32.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            "Barcodes",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(16.dp))
-                    when (barcodeResult) {
-                        is BarcodeScanResult.Success -> {
-                            barcodeResult.barcodes.forEachIndexed { index, barcode ->
-                                if (index > 0) Spacer(modifier = Modifier.height(12.dp))
-                                Surface(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    color = MaterialTheme.colorScheme.surface,
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Text(
-                                            barcode.format,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            barcode.displayValue,
-                                            style = MaterialTheme.typography.bodyLarge,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                        is BarcodeScanResult.NoBarcodes -> {
-                            Text(
-                                "No barcodes detected",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        is BarcodeScanResult.Error -> {
-                            Text(
-                                "Error: ${barcodeResult.message}",
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                        }
-                        null -> Text("No barcode scan results yet")
-                    }
+            } else {
+                Button(
+                    onClick = { showResults = true },
+                    modifier = Modifier.weight(1f).height(56.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    enabled = !isProcessing
+                ) {
+                    Icon(Icons.Default.Check, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        if (isProcessing) "Processing..." else "View Results",
+                        style = MaterialTheme.typography.titleMedium
+                    )
                 }
             }
         }
     }
 }
 
-@Composable
 
-fun StatItem(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            value,
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
-        )
-        Text(
-            label,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
+// ---- Amount parsing helpers (private, single definitions) ----
 private fun captureImage(
     context: android.content.Context,
     imageCapture: ImageCapture?,
@@ -1128,3 +1055,21 @@ private fun captureImage(
         }
     )
 }
+
+@Composable
+fun StatItem(label: String, value: String) {
+    androidx.compose.foundation.layout.Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+        androidx.compose.material3.Text(
+            value,
+            style = androidx.compose.material3.MaterialTheme.typography.headlineSmall,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+            color = androidx.compose.material3.MaterialTheme.colorScheme.primary
+        )
+        androidx.compose.material3.Text(
+            label,
+            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+            color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+

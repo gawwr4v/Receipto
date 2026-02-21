@@ -10,7 +10,6 @@ import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
-import kotlin.text.lines
 
 /**
  * Processes images to extract text using ML Kit's on-device OCR
@@ -49,14 +48,12 @@ class OcrProcessor(private val context: Context) {
         return try {
             Log.d("OcrProcessor", "Starting OCR processing with OpenCV pipeline")
 
-            // Process ORIGINAL image (without OpenCV)
-            val originalInputImage = InputImage.fromBitmap(bitmap
-
-                , 0)
+            // OCR on original bitmap
+            val originalInputImage = InputImage.fromBitmap(bitmap, 0)
             val originalVisionText = textRecognizer.process(originalInputImage).await()
             Log.d("OcrProcessor", "ORIGINAL OCR detected ${originalVisionText.text.length} characters")
 
-            // Process with OpenCV preprocessing
+            // Preprocess with OpenCV
             val preprocessedBitmap = try {
                 ImagePreprocessor.preprocess(bitmap)
             } catch (e: Exception) {
@@ -64,11 +61,12 @@ class OcrProcessor(private val context: Context) {
                 bitmap
             }
 
+            // OCR on preprocessed bitmap
             val preprocessedInputImage = InputImage.fromBitmap(preprocessedBitmap, 0)
             val preprocessedVisionText = textRecognizer.process(preprocessedInputImage).await()
             Log.d("OcrProcessor", "PREPROCESSED OCR detected ${preprocessedVisionText.text.length} characters")
 
-            // Detect layout regions
+            // Detect layout regions on the preprocessed image (more stable)
             val detectedRegions = try {
                 LayoutDetector.detectRegions(preprocessedBitmap)
             } catch (e: Exception) {
@@ -79,14 +77,14 @@ class OcrProcessor(private val context: Context) {
             val classifiedRegions = try {
                 RegionClassifier.classify(detectedRegions)
             } catch (e: Exception) {
-                Log.e("Ocr Processor", "Region classification failed", e)
-                        emptyList()
+                Log.e("OcrProcessor", "Region classification failed", e)
+                emptyList()
             }
 
             Log.d("OcrProcessor", "Detected ${classifiedRegions.size} regions")
 
-            // USE THE BETTER RESULT (more characters detected)
-            val visionText = if (originalVisionText.text.length > preprocessedVisionText.text.length) {
+            // Choose the better OCR result (more characters)
+            val chosenVisionText = if (originalVisionText.text.length > preprocessedVisionText.text.length) {
                 Log.d("OcrProcessor", "Using ORIGINAL (better)")
                 originalVisionText
             } else {
@@ -94,10 +92,16 @@ class OcrProcessor(private val context: Context) {
                 preprocessedVisionText
             }
 
-            if (visionText.text.isEmpty()) {
+            if (chosenVisionText.text.isEmpty()) {
                 OcrResult.Error("No text detected in image")
             } else {
-                parseVisionTextWithRegions(visionText, classifiedRegions)
+                // Use the incoming bitmap dimensions as page dims (preprocess preserves size)
+                parseVisionTextWithRegions(
+                    visionText = chosenVisionText,
+                    regions = classifiedRegions,
+                    pageWidth = bitmap.width,
+                    pageHeight = bitmap.height
+                )
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -107,14 +111,18 @@ class OcrProcessor(private val context: Context) {
 
     /**
      * Parse ML Kit's Text result into our structured format with region information
+     * Also includes word-level tokens (with bounding boxes) and page dimensions.
      */
     private fun parseVisionTextWithRegions(
         visionText: Text,
-        regions: List<ClassifiedRegion>
+        regions: List<ClassifiedRegion>,
+        pageWidth: Int,
+        pageHeight: Int
     ): OcrResult {
         val fullText = visionText.text
         val lines = mutableListOf<TextLine>()
         val words = mutableListOf<String>()
+        val tokens = mutableListOf<OcrToken>() // word-level tokens + bounding boxes
 
         for (block in visionText.textBlocks) {
             for (line in block.lines) {
@@ -131,6 +139,10 @@ class OcrProcessor(private val context: Context) {
 
                 for (element in line.elements) {
                     words.add(element.text)
+                    val r = element.boundingBox
+                    if (r != null) {
+                        tokens.add(OcrToken(text = element.text, boundingBox = r))
+                    }
                 }
             }
         }
@@ -140,16 +152,19 @@ class OcrProcessor(private val context: Context) {
             lines = lines,
             words = words,
             blockCount = visionText.textBlocks.size,
-            detectedRegions = regions
+            detectedRegions = regions,
+            tokens = tokens,
+            pageWidth = pageWidth,
+            pageHeight = pageHeight
         )
     }
 
-
     /**
-     * Parse ML Kit's Text result into our structured format (legacy method without regions)
+     * Legacy parse (no regions, no tokens)
      */
     private fun parseVisionText(visionText: Text): OcrResult {
-        return parseVisionTextWithRegions(visionText, emptyList())
+        // Page dims unknown here; pass zeros (callers should prefer the regions variant)
+        return parseVisionTextWithRegions(visionText, emptyList(), 0, 0)
     }
 
     /**
@@ -169,16 +184,19 @@ sealed class OcrResult {
         val lines: List<TextLine>,
         val words: List<String>,
         val blockCount: Int,
-        val detectedRegions: List<ClassifiedRegion> = emptyList()  // NEW: Layout regions
+        val detectedRegions: List<ClassifiedRegion> = emptyList(),
+        // NEW: word-level tokens for KIE and general-purpose spatial post-processing
+        val tokens: List<OcrToken> = emptyList(),
+        // NEW: original page dimensions for bbox normalization / KIE encoding
+        val pageWidth: Int = 0,
+        val pageHeight: Int = 0
     ) : OcrResult() {
-
         val lineCount: Int get() = lines.size
         val wordCount: Int get() = words.size
         val avgConfidence: Float get() =
-            if (lines.isEmpty()) 0f
-            else lines.map { it.confidence }.average().toFloat()
+            if (lines.isEmpty()) 0f else lines.map { it.confidence }.average().toFloat()
 
-        // NEW: Helper methods for region-based parsing
+        // Optional helper (depends on ClassifiedRegion carrying text; safe to ignore if blank)
         fun getTextInRegion(regionType: RegionType): String {
             return detectedRegions
                 .filter { it.type == regionType }
@@ -198,4 +216,12 @@ data class TextLine(
     val text: String,
     val confidence: Float,
     val boundingBox: android.graphics.Rect?
+)
+
+/**
+ * Represents a single word/token with its bounding box
+ */
+data class OcrToken(
+    val text: String,
+    val boundingBox: android.graphics.Rect
 )
