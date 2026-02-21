@@ -31,3 +31,5 @@ build_log*.txt
 /*_log*.txt
 build_*.txt
 test_*.txt
+/*error*.txt
+/compile.txt
