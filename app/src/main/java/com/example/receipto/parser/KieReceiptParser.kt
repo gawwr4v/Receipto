@@ -118,25 +118,40 @@ class KieReceiptParser(private val context: Context) {
         return null
     }
 
-    private fun groupTokensIntoLines(tokens: List<UiTok>, pageHeight: Int): List<MutableList<UiTok>> {
-        data class Tn(val tok: UiTok, val yCenter: Float)
+    internal fun groupTokensIntoLines(tokens: List<UiTok>, pageHeight: Int): List<MutableList<UiTok>> {
         if (tokens.isEmpty()) return emptyList()
+
+        // 1. Calculate a dynamic row tolerance using Median Height of all text tokens
+        val heights = tokens.map { it.box.height() }.sorted()
+        val medianHeightPx = if (heights.isNotEmpty()) heights[heights.size / 2].toFloat() else 0f
+        val normalizedMedianHeight = medianHeightPx / pageHeight.toFloat()
+        
+        // A physical line is strictly bounded by 50% of the median character height
+        val lineThresh = (normalizedMedianHeight * 0.5f).coerceAtLeast(0.015f)
+
+        data class Tn(val tok: UiTok, val yCenter: Float)
         val tn = tokens.map {
             val yc = ((it.box.top + it.box.bottom) * 0.5f) / pageHeight.toFloat()
             Tn(it, yc.coerceIn(0f, 1f))
         }.sortedBy { it.yCenter }
 
-        val lineThresh = 0.028f
         val lines = mutableListOf<MutableList<UiTok>>()
         var cur = mutableListOf<Tn>()
+        var currentLineCenterY = 0f
+
         for (t in tn) {
-            if (cur.isEmpty()) cur.add(t) else {
-                val avgY = cur.map { it.yCenter }.average().toFloat()
-                if (kotlin.math.abs(t.yCenter - avgY) <= lineThresh) cur.add(t)
-                else {
+            if (cur.isEmpty()) {
+                cur.add(t)
+                currentLineCenterY = t.yCenter
+            } else {
+                // strict comparison against the baseline of the line to prevent cascading drift
+                if (kotlin.math.abs(t.yCenter - currentLineCenterY) <= lineThresh) {
+                    cur.add(t)
+                } else {
                     lines.add(cur.map { it.tok }.toMutableList())
                     cur.clear()
                     cur.add(t)
+                    currentLineCenterY = t.yCenter
                 }
             }
         }
@@ -212,14 +227,14 @@ class KieReceiptParser(private val context: Context) {
 
     private fun isPriceLikeStrict(raw: String): Boolean {
         val s = raw.trim().replace(" ", "")
-        val us = Regex("""^[$€£]?\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^[$€£]?\d+\.\d{2}$""")
-        val eu = Regex("""^\d{1,3}(?:\.\d{3})*(?:,\d{2})$|^\d+,\d{2}$""")
+        val us = Regex("""^[$€£]?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})$|^[$€£]?\d+\.\d{1,2}$""")
+        val eu = Regex("""^\d{1,3}(?:\.\d{3})*(?:,\d{1,2})$|^\d+,\d{1,2}$""")
         return s.matches(us) || s.matches(eu)
     }
 
     private fun parseAmountsInText(raw: String): List<Double> {
-        val s = raw.replace('\u00A0', ' ').replace(Regex("""([.,])\s+(\d{2})(?!\d)"""), "$1$2")
-        val pat = Regex("""(?<!\w)(?:[$€£]\s*)?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})(?!\w)|(?<!\w)(?:[$€£]\s*)?\d{2,}(?!\w)""")
+        val s = raw.replace('\u00A0', ' ').replace(Regex("""([.,])\s+(\d{1,2})(?!\d)"""), "$1$2")
+        val pat = Regex("""(?<!\w)(?:[$€£]\s*)?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})(?!\w)""")
         return pat.findAll(s)
             .mapNotNull { m -> parseAmountString(m.value) }
             .filter { it < 1_000_000.0 }
@@ -281,11 +296,16 @@ class KieReceiptParser(private val context: Context) {
     private fun rightmostPriceOnLine(line: List<UiTok>): Double? {
         data class Cand(val xRight: Int, val amount: Double)
         val cands = mutableListOf<Cand>()
-        for (tok in line) {
+        for (i in line.indices) {
+            val tok = line[i]
             val amounts = parseAmountsInText(tok.text)
             when {
                 amounts.isNotEmpty() -> cands += Cand(tok.box.right, amounts.last())
                 isPriceLikeStrict(tok.text) -> parseAmountString(tok.text)?.let { cands += Cand(tok.box.right, it) }
+                // Allow isolated integers if they are the VERY LAST token on a physical line (More Retail Indian receipts)
+                i == line.lastIndex && tok.text.trim().matches(Regex("""^[$€£]?\d{1,4}$""")) -> {
+                    parseAmountString(tok.text)?.let { cands += Cand(tok.box.right, it) }
+                }
             }
         }
         return cands.maxByOrNull { it.xRight }?.amount
@@ -395,7 +415,7 @@ class KieReceiptParser(private val context: Context) {
         return m?.let { "CARD •••• ${it.groupValues[1]}" }
     }
 
-    private fun assembleReceiptFromKie(
+    internal fun assembleReceiptFromKie(
         merged: List<UiTok>,
         tags: List<String>,
         pageHeight: Int
@@ -435,7 +455,58 @@ class KieReceiptParser(private val context: Context) {
         val storeCand = phrases.filter { it.tag == "STORE" && isHeader(it.box) }.maxByOrNull { it.text.length }
         val storeName = storeCand?.text ?: fallbackStoreFromHeader(merged, pageHeight)
 
-        val lines = groupTokensIntoLines(merged, pageHeight)
+        var lines = groupTokensIntoLines(merged, pageHeight).map { it.toList() }
+
+        fun amountsOnLine(line: List<UiTok>): List<Double> {
+            val res = line.flatMap { parseAmountsInText(it.text) }.filter { it >= 0.0 && it < 100_000.0 }.toMutableList()
+            if (res.isEmpty() && line.isNotEmpty()) {
+                val lastTokRaw = line.last().text.trim()
+                if (lastTokRaw.matches(Regex("""^[$€£]?\d{1,4}$"""))) {
+                    parseAmountString(lastTokRaw)?.let { res.add(it) }
+                }
+            }
+            return res
+        }
+
+        // --- MERGE VERTICAL MULTI-LINE ITEMS (e.g., More Retail Indian receipts and Grotto modifiers) ---
+        val pageWidthApprox = merged.maxOfOrNull { it.box.right }?.toFloat() ?: 1000f
+        val indentThreshold = pageWidthApprox * 0.015f
+
+        val consolidatedLines = mutableListOf<List<UiTok>>()
+        var lineIdx = 0
+        while (lineIdx < lines.size) {
+            var currentLine = lines[lineIdx]
+            
+            while (lineIdx + 1 < lines.size) {
+                val nextLine = lines[lineIdx + 1]
+                if (isHeader(currentLine.first().box) || isFooter(currentLine.first().box)) break
+                if (isHeader(nextLine.first().box) || isFooter(nextLine.first().box)) break
+                
+                val currentY = currentLine.map { ((it.box.top + it.box.bottom) * 0.5f) / pageHeight.toFloat() }.average().toFloat()
+                val nextY = nextLine.map { ((it.box.top + it.box.bottom) * 0.5f) / pageHeight.toFloat() }.average().toFloat()
+                if (nextY - currentY > 0.05f) break // Too far apart vertically
+                
+                val currentLeft = currentLine.first().box.left.toFloat()
+                val nextLeft = nextLine.first().box.left.toFloat()
+                
+                val currentAmounts = amountsOnLine(currentLine)
+                val nextAmounts = amountsOnLine(nextLine)
+
+                val isMoreRetail = currentAmounts.isEmpty() && nextAmounts.isNotEmpty() && nextLeft >= currentLeft - indentThreshold
+                val isGrotto = currentAmounts.isNotEmpty() && nextAmounts.isEmpty() && nextLeft >= currentLeft + indentThreshold
+                val isMultiLineModifier = currentAmounts.isEmpty() && nextAmounts.isEmpty() && nextLeft >= currentLeft - indentThreshold
+                
+                if (isMoreRetail || isGrotto || isMultiLineModifier) {
+                    currentLine = (currentLine + nextLine).sortedBy { it.box.left }
+                    lineIdx++
+                } else {
+                    break
+                }
+            }
+            consolidatedLines.add(currentLine)
+            lineIdx++
+        }
+        lines = consolidatedLines
 
         fun findLineForBox(box: Rect): List<UiTok>? {
             val cy = ((box.top + box.bottom) * 0.5f) / pageHeight.toFloat()
@@ -449,16 +520,13 @@ class KieReceiptParser(private val context: Context) {
         val names = phrases.filter { it.tag == "ITEM_NAME" && !looksLikeDateOrTime(it.text) }
         val pricePhrases = phrases.filter { it.tag == "ITEM_PRICE" }
 
-        fun amountsOnLine(line: List<UiTok>): List<Double> =
-            line.flatMap { parseAmountsInText(it.text) }.filter { it > 0.0 && it < 100_000.0 }
-
         for (name in names) {
             val cy = ((name.box.top + name.box.bottom) * 0.5f) / pageHeight.toFloat()
             val sameLineKie = pricePhrases.filter { p ->
                 val py = ((p.box.top + p.box.bottom) * 0.5f) / pageHeight.toFloat()
                 kotlin.math.abs(py - cy) < 0.03f && p.box.left >= name.box.left
             }.sortedBy { it.box.left - name.box.left }
-            val priceFromKie: Double? = sameLineKie.firstNotNullOfOrNull { parseAmountsInText(it.text).firstOrNull() }
+            val priceFromKie: Double? = sameLineKie.firstNotNullOfOrNull { parseAmountString(it.text) }
 
             val line: List<UiTok>? = findLineForBox(name.box)
             val qty: Int? = line?.let { extractQuantityFromLine(it) }
@@ -469,7 +537,7 @@ class KieReceiptParser(private val context: Context) {
 
             val selected: Double? = listOfNotNull(priceFromKie, priceFromRight, priceFromRightmost, priceFromEmbedded)
                 .firstOrNull()
-                ?.takeIf { it > 0.0 && it < 100_000.0 }
+                ?.takeIf { it >= 0.0 && it < 100_000.0 }
 
             var finalPrice: Double? = selected
             if (line != null && qty != null && qty >= 2) {
@@ -490,12 +558,14 @@ class KieReceiptParser(private val context: Context) {
                 }
             }
 
-            finalPrice = finalPrice?.takeIf { it > 0.0 && it < 100_000.0 }
+            finalPrice = finalPrice?.takeIf { it >= 0.0 && it < 100_000.0 }
             if (finalPrice != null) {
                 val cleanedName = name.text.replace(
-                    Regex("""\$?\s*-?\d{1,3}(,\d{3})*(\.\d{2})|\$?\s*-?\d+(?:\.\d{2})|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})"""),
+                    Regex("""\$?\s*-?\d{1,3}(,\d{3})*(\.\d{1,2})|\$?\s*-?\d+(?:\.\d{1,2})|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})"""),
                     ""
-                ).trim()
+                ).replace(Regex("""^\s*[A-Za-z]\s+"""), "")
+                 .replace(Regex("""\s+[A-Za-z]\s*$"""), "")
+                 .trim()
                 items.add(
                     ReceiptItem(
                         name = if (cleanedName.isNotEmpty()) cleanedName else name.text,
@@ -513,13 +583,13 @@ class KieReceiptParser(private val context: Context) {
 
         // --- Strong Heuristic Item Fallback ---
         val heuristicItems = mutableListOf<ReceiptItem>()
-        val priceRegex = Regex("""\$?\s*-?\d{1,3}(,\d{3})*(\.\d{2})|\$?\s*-?\d+(?:\.\d{2})|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})""")
+        val priceRegex = Regex("""\$?\s*-?\d{1,3}(,\d{3})*(\.\d{1,2})|\$?\s*-?\d+(?:\.\d{1,2})|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})""")
         
         for (line in lines) {
             if (line.isEmpty() || isHeader(line.first().box) || isFooter(line.first().box)) continue
             
             val rawLine = line.joinToString(" ") { it.text }
-            val fixedLine = rawLine.replace('\u00A0', ' ').replace(Regex("""([.,])\s+(\d{2})(?!\d)"""), "$1$2")
+            val fixedLine = rawLine.replace('\u00A0', ' ').replace(Regex("""([.,])\s+(\d{1,2})(?!\d)"""), "$1$2")
             val up = fixedLine.uppercase(Locale.US)
             
             // Skip common non-item lines
@@ -528,15 +598,21 @@ class KieReceiptParser(private val context: Context) {
                 priceWordKeysSub.any { up.contains(it) } ||
                 up.contains("CHANGE") || up.contains("CAMBIO") || up.contains("CASH")) continue
                 
-            val amounts = parseAmountsInText(fixedLine)
+            val amounts = amountsOnLine(line)
             if (amounts.isNotEmpty()) {
                 val qty = extractQuantityFromLine(line)
                 val price = amounts.last()
                 
                 // Clean the name
-                val nameCand = fixedLine.replace(priceRegex, "")
+                var nameCand = fixedLine.replace(priceRegex, "")
+                if (price == parseAmountString(line.last().text)) {
+                    nameCand = nameCand.removeSuffix(line.last().text)
+                }
+                nameCand = nameCand
                     .replace(Regex("""^\s*\d+\s+"""), "") // strip leading quantity
                     .replace(Regex("""^\s*x\s+"""), "")   // strip leading multiplier
+                    .replace(Regex("""^\s*[A-Za-z]\s+"""), "") // strip leading isolated char (like E)
+                    .replace(Regex("""\s+[A-Za-z]\s*$"""), "") // strip trailing isolated char
                     .trim()
                 
                 // If the remainder looks like an actual product string
@@ -560,11 +636,11 @@ class KieReceiptParser(private val context: Context) {
             }
         }
 
-        val totalFromKie = phrases.firstOrNull { it.tag == "TOTAL" }?.text?.let { parseAmountsInText(it).firstOrNull() }
-        var subtotal = phrases.firstOrNull { it.tag == "SUBTOTAL" }?.text?.let { parseAmountsInText(it).firstOrNull() }
+        val totalFromKie = phrases.firstOrNull { it.tag == "TOTAL" }?.text?.let { parseAmountString(it) }
+        var subtotal = phrases.firstOrNull { it.tag == "SUBTOTAL" }?.text?.let { parseAmountString(it) }
         if (subtotal == null) subtotal = findLineByKeys(priceWordKeysSub)?.let { rightmostPriceOnLine(it) }
 
-        var tax = phrases.firstOrNull { it.tag == "TAX" }?.text?.let { parseAmountsInText(it).firstOrNull() }
+        var tax = phrases.firstOrNull { it.tag == "TAX" }?.text?.let { parseAmountString(it) }
         if (tax == null) tax = findLineByKeys(priceWordKeysTax)?.let { rightmostPriceOnLine(it) }
 
         fun lexicalTotalFromMerged(): Double? = findLineByKeys(priceWordKeysTotal)?.let { rightmostPriceOnLine(it) }
